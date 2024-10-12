@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Detección de Objetos - Versión Horizontal</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+        .container {
+            display: flex;
+            flex: 1;
+            gap: 20px;
+        }
+        .left-panel, .right-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        h1 {
+            color: #333;
+            margin-top: 0;
+        }
+        #video-container {
+            position: relative;
+            width: 100%;
+            height: 0;
+            padding-bottom: 56.25%; /* 16:9 Aspect Ratio */
+            background-color: #000;
+            overflow: hidden;
+        }
+        #webcam, #canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        .panel {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+            overflow-y: auto;
+        }
+        #object-list {
+            list-style-type: none;
+            padding: 0;
+        }
+        #object-list li {
+            margin-bottom: 10px;
+            padding: 10px;
+            background-color: #f8f8f8;
+            border-radius: 4px;
+        }
+        #error-message {
+            color: red;
+            margin-top: 20px;
+        }
+        #loading {
+            font-size: 18px;
+            margin-top: 20px;
+        }
+        .slider {
+            width: 100%;
+            margin: 10px 0;
+        }
+        label {
+            display: block;
+            margin-top: 10px;
+        }
+        select, button {
+            width: 100%;
+            padding: 5px;
+            margin-top: 5px;
+        }
+        #stats {
+            font-size: 14px;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Detección de Objetos - Versión Horizontal</h1>
+    <div class="container">
+        <div class="left-panel">
+            <div id="video-container">
+                <video id="webcam" autoplay></video>
+                <canvas id="canvas"></canvas>
+            </div>
+            <div class="panel">
+                <h2>Estadísticas</h2>
+                <div id="stats">FPS: 0, Latencia: 0ms</div>
+            </div>
+        </div>
+        <div class="right-panel">
+            <div class="panel">
+                <h2>Configuración</h2>
+                <label for="modelSelect">Modelo:</label>
+                <select id="modelSelect">
+                    <option value="lite_mobilenet_v2">MobileNet V2 Lite (Rápido)</option>
+                    <option value="mobilenet_v2" selected>MobileNet V2 (Balanceado)</option>
+                    <option value="mobilenet_v1">MobileNet V1 (Preciso)</option>
+                </select>
+                <label for="confidenceThreshold">Umbral de confianza: <span id="confidenceThresholdValue">0.6</span></label>
+                <input type="range" id="confidenceThreshold" class="slider" min="0" max="1" step="0.05" value="0.6">
+                <label for="iouThreshold">Umbral de IOU: <span id="iouThresholdValue">0.5</span></label>
+                <input type="range" id="iouThreshold" class="slider" min="0" max="1" step="0.05" value="0.5">
+                <button id="applySettings">Aplicar cambios</button>
+            </div>
+            <div class="panel">
+                <h2>Objetos Detectados</h2>
+                <ul id="object-list"></ul>
+            </div>
+        </div>
+    </div>
+    <div id="loading">Cargando modelo...</div>
+    <div id="error-message"></div>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const objectList = document.getElementById('object-list');
+        const errorMessage = document.getElementById('error-message');
+        const loadingMessage = document.getElementById('loading');
+        const confidenceThreshold = document.getElementById('confidenceThreshold');
+        const confidenceThresholdValue = document.getElementById('confidenceThresholdValue');
+        const iouThreshold = document.getElementById('iouThreshold');
+        const iouThresholdValue = document.getElementById('iouThresholdValue');
+        const modelSelect = document.getElementById('modelSelect');
+        const applySettingsButton = document.getElementById('applySettings');
+        const statsDiv = document.getElementById('stats');
+
+        let model;
+        let detectedObjects = new Map();
+        let isModelReady = false;
+        let currentConfidenceThreshold = 0.6;
+        let currentIouThreshold = 0.5;
+        let currentModelType = 'mobilenet_v2';
+        let lastDetectionTime = 0;
+        let frameCount = 0;
+        let lastFpsUpdateTime = 0;
+
+        async function setupCamera() {
+            const videoContainer = document.getElementById('video-container');
+            const containerWidth = videoContainer.clientWidth;
+            const containerHeight = videoContainer.clientHeight;
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        facingMode: 'environment',
+                        width: { ideal: containerWidth },
+                        height: { ideal: containerHeight }
+                    } 
+                });
+                video.srcObject = stream;
+                return new Promise((resolve) => {
+                    video.onloadedmetadata = () => {
+                        canvas.width = video.videoWidth;
+                        canvas.height = video.videoHeight;
+                        resolve(video);
+                    };
+                });
+            } catch (error) {
+                errorMessage.textContent = 'Error al acceder a la cámara: ' + error.message;
+                throw error;
+            }
+        }
+
+        async function loadModel() {
+            loadingMessage.textContent = 'Cargando modelo...';
+            try {
+                model = await cocoSsd.load({ base: currentModelType });
+                isModelReady = true;
+                loadingMessage.style.display = 'none';
+            } catch (error) {
+                errorMessage.textContent = 'Error al cargar el modelo: ' + error.message;
+                throw error;
+            }
+        }
+
+        function drawPredictions(predictions) {
+            ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+            ctx.drawImage(video, 0, 0, ctx.canvas.width, ctx.canvas.height);
+            ctx.font = '16px sans-serif';
+            ctx.textBaseline = 'top';
+
+            predictions.forEach(prediction => {
+                const [x, y, width, height] = prediction.bbox;
+                const label = `${prediction.class} (${Math.round(prediction.score * 100)}%)`;
+
+                ctx.strokeStyle = '#00FFFF';
+                ctx.lineWidth = 4;
+                ctx.strokeRect(x, y, width, height);
+
+                ctx.fillStyle = 'rgba(0, 255, 255, 0.5)';
+                const textWidth = ctx.measureText(label).width;
+                const textHeight = parseInt(ctx.font, 10);
+                ctx.fillRect(x, y, textWidth + 4, textHeight + 4);
+
+                ctx.fillStyle = '#000000';
+                ctx.fillText(label, x, y);
+
+                updateDetectedObjectsList(prediction.class, prediction.score);
+            });
+        }
+
+        function updateDetectedObjectsList(objectClass, confidence) {
+            if (!detectedObjects.has(objectClass) || confidence > detectedObjects.get(objectClass).confidence) {
+                const now = new Date();
+                detectedObjects.set(objectClass, { time: now.toLocaleTimeString(), confidence: confidence });
+                
+                objectList.innerHTML = '';
+                Array.from(detectedObjects.entries())
+                    .sort((a, b) => b[1].confidence - a[1].confidence)
+                    .forEach(([className, data]) => {
+                        const listItem = document.createElement('li');
+                        listItem.textContent = `${className} - Detectado a las ${data.time} (Confianza: ${(data.confidence * 100).toFixed(2)}%)`;
+                        objectList.appendChild(listItem);
+                    });
+            }
+        }
+
+        async function detectObjects() {
+            const startTime = performance.now();
+
+            if (!isModelReady) {
+                requestAnimationFrame(detectObjects);
+                return;
+            }
+
+            try {
+                const predictions = await model.detect(video);
+                const filteredPredictions = predictions.filter(prediction => prediction.score >= currentConfidenceThreshold);
+                drawPredictions(filteredPredictions);
+
+                const endTime = performance.now();
+                const latency = endTime - startTime;
+                updateStats(latency);
+
+            } catch (error) {
+                console.error('Error en la detección:', error);
+            }
+
+            requestAnimationFrame(detectObjects);
+        }
+
+        function updateStats(latency) {
+            frameCount++;
+            const now = performance.now();
+            if (now - lastFpsUpdateTime >= 1000) {
+                const fps = Math.round((frameCount * 1000) / (now - lastFpsUpdateTime));
+                statsDiv.textContent = `FPS: ${fps}, Latencia: ${latency.toFixed(2)}ms`;
+                frameCount = 0;
+                lastFpsUpdateTime = now;
+            }
+        }
+
+        async function initializeApp() {
+            await setupCamera();
+            await loadModel();
+            detectObjects();
+        }
+
+        confidenceThreshold.addEventListener('input', (e) => {
+            confidenceThresholdValue.textContent = e.target.value;
+        });
+
+        iouThreshold.addEventListener('input', (e) => {
+            iouThresholdValue.textContent = e.target.value;
+        });
+
+        applySettingsButton.addEventListener('click', async () => {
+            currentConfidenceThreshold = parseFloat(confidenceThreshold.value);
+            currentIouThreshold = parseFloat(iouThreshold.value);
+            const newModelType = modelSelect.value;
+
+            if (newModelType !== currentModelType) {
+                currentModelType = newModelType;
+                isModelReady = false;
+                if (model) {
+                    model.dispose();
+                }
+                await loadModel();
+            }
+
+            detectedObjects.clear();
+            objectList.innerHTML = '';
+        });
+
+        initializeApp().catch(error => {
+            console.error('Error en la aplicación:', error);
+            errorMessage.textContent = 'Error en la aplicación: ' + error.message;
+        });
+    </script>
+</body>
+</html>
